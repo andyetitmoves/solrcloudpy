@@ -13,16 +13,14 @@ To get a :class:`~solrcloudpy.SolrCollection` instance from a :class:`SolrConnec
 
 
 """
-import urllib
-import json
 import semver
 
 import solrcloudpy.collection as collection
-from solrcloudpy.utils import _Request
+from solrcloudpy.zkclient import ZKClient
+from solrcloudpy.solrzkstate import SolrZKState
 
 MIN_SUPPORTED_VERSION = '>=4.6.0'
 MAX_SUPPORTED_VERSION = '<=6.1.0'
-
 
 class SolrConnection(object):
 
@@ -58,41 +56,35 @@ class SolrConnection(object):
         self.timeout = timeout
         self.webappdir = webappdir
         self.version = version
-        
-        if not semver.match(version, MIN_SUPPORTED_VERSION) and semver.match(version, MAX_SUPPORTED_VERSION):
+
+        if not semver.match(version, MIN_SUPPORTED_VERSION) and \
+           semver.match(version, MAX_SUPPORTED_VERSION):
             raise StandardError("Unsupported version %s" % version)
-        
-        if semver.match(self.version, '<5.4.0'):
-            self.zk_path = '/{webappdir}/zookeeper'.format(webappdir=self.webappdir)
-        else:
-            self.zk_path = '/{webappdir}/admin/zookeeper'.format(webappdir=self.webappdir)
-        
+
         self.url_template = 'http://{{server}}/{webappdir}/'.format(webappdir=self.webappdir)
 
-        if type(server) == str:
-            self.url = self.url_template.format(server=server)
-            servers = [self.url, self.url]
-            if detect_live_nodes:
-                url = servers[0]
-                self.servers = self.detect_nodes(url)
-            else:
-                self.servers = servers
-        if type(server) == list:
-            servers = [self.url_template.format(server=a) for a in server]
-            if detect_live_nodes:
-                url = servers[0]
-                self.servers = self.detect_nodes(url)
-            else:
-                self.servers = servers
+        if isinstance(server, ZKClient):
+            self._zk_state = SolrZKState(server)
+            self.servers = self.live_nodes
+        else:
+            if type(server) == str:
+                url = self.url_template.format(server=server)
+                self.servers = [url, url]
+                if type(server) == list:
+                    self.servers = [self.url_template.format(server=a) for a in server]
 
-        self.client = _Request(self)
+            from solrcloudpy.solrzkclient import SolrZKClient
+            self._zk_state = SolrZKState(SolrZKClient(self))
+
+            if detect_live_nodes:
+                self.servers = self.live_nodes
 
     def detect_nodes(self, _):
         """
-        Queries Solr's zookeeper integration for live nodes
-        
+        Queries Zookeeper interface for live nodes
+
         DEPRECATED
-        
+
         :return: a list of sorl URLs corresponding to live nodes in solrcloud
         :rtype: list
         """
@@ -102,37 +94,11 @@ class SolrConnection(object):
         """
         Lists out the current collections in the cluster
         This should probably be a recursive function but I'm not in the mood today
-        
+
         :return: a list of collection names
         :rtype: list
         """
-        params = {'detail': 'false', 'path': '/collections'}
-        response = self.client.get(
-            self.zk_path, params).result
-        
-        if 'children' not in response['tree'][0]:
-            return []
-
-        if response['tree'][0]['data']['title'] == '/collections':
-            # solr 5.3 and older
-            data = response['tree'][0]['children']
-        else:
-            # solr 5.4+
-            data = None
-            for branch in response['tree']:
-                if data is not None:
-                    break
-                for child in branch['children']:
-                    if child['data']['title'] == '/collections':
-                        if 'children' not in child:
-                            return []
-                        else:
-                            data = child['children']
-                            break
-        colls = []
-        if data:
-            colls = [node['data']['title'] for node in data]
-        return colls
+        return self._zk_state.list_collections()
 
     def _list_cores(self):
         """
@@ -140,8 +106,11 @@ class SolrConnection(object):
         :return: a list of cores
         :rtype: list
         """
+        if self._client is None:
+            from solrcloudpy.utils import _Request
+            self._client = _Request(self)
         params = {'wt': 'json', }
-        response = self.client.get(
+        response = self._client.get(
             ('/{webappdir}/admin/cores'.format(webappdir=self.webappdir)), params).result
         cores = response.get('status', {}).keys()
         return cores
@@ -151,59 +120,31 @@ class SolrConnection(object):
         """
         Determine the state of all nodes and collections in the cluster. Problematic nodes or
         collections are returned, along with their state, otherwise an `OK` message is returned
-        
+
         :return: a dict representing the status of the cluster
         :rtype: dict
         """
-        params = {'detail': 'true', 'path': '/clusterstate.json'}
-        response = self.client.get(
-            ('/{webappdir}/zookeeper'.format(webappdir=self.webappdir)), params).result
-        data = json.loads(response['znode']['data'])
-        res = []
-        collections = self.list()
-        for coll in collections:
-            shards = data[coll]['shards']
-            for shard, shard_info in shards.iteritems():
-                replicas = shard_info['replicas']
-                for replica, info in replicas.iteritems():
-                    state = info['state']
-                    if state != 'active':
-                        item = {"collection": coll,
-                                "replica": replica,
-                                "shard": shard,
-                                "info": info,
-                                }
-                        res.append(item)
-
-        if not res:
-            return {"status": "OK"}
-
-        return {"status": "NOT OK", "details": res}
+        return self._zk_state.cluster_health
 
     @property
     def cluster_leader(self):
         """
         Gets the cluster leader
-        
+
         :rtype: dict
         :return: a dict with the json loaded from the zookeeper response related to the cluster leader request
         """
-        params = {'detail': 'true', 'path': '/overseer_elect/leader'}
-        response = self.client.get(self.zk_path, params).result
-        return json.loads(response['znode']['data'])
+        return self._zk_state.cluster_leader
 
     @property
     def live_nodes(self):
         """
         Lists all nodes that are currently online
-        
+
         :return: a list of urls related to live nodes
         :rtype: list
         """
-        params = {'detail': 'true', 'path': '/live_nodes'}
-        response = self.client.get(self.zk_path, params).result
-        children = [d['data']['title'] for d in response['tree'][0]['children']]
-        nodes = [c.replace('_solr', '') for c in children]
+        nodes = self._zk_state.live_nodes
         return [self.url_template.format(server=a) for a in nodes]
 
     def create_collection(self, collname, *args, **kwargs):
@@ -214,7 +155,7 @@ class SolrConnection(object):
         :type collname: str
         :param \*args: additional arguments
         :param \*\*kwargs: additional named parameters
-        
+
         :return: the created collection
         :rtype: SolrCollection
         """
@@ -241,9 +182,9 @@ class SolrConnection(object):
 
     def __dir__(self):
         """
-        Convenience method for viewing servers available in this connection
-        
-        :return: a list of servers
+        Convenience method for viewing collections available in this cloud
+
+        :return: a list of collections
         :rtype: list
         """
         return self.list()
